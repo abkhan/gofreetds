@@ -1,12 +1,15 @@
 package freetds
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 )
 
 var poolExpiresInterval = 5 * time.Minute
 var poolCleanupInterval = time.Minute
+var connGetDefaultInterval = 5 * time.Second
 
 //ConnPool - connection pool for the maxCount connections.
 //
@@ -110,10 +113,41 @@ func (p *ConnPool) Get() (*Conn, error) {
 	return conn, nil
 }
 
-//Get connection from pool and execute handler.
+//GetWithContext returns connection from the pool.
+//Blocks for given time if there are no free connections, and maxConn is reached,
+func (p *ConnPool) GetWithContext(c context.Context) (*Conn, error) {
+	select {
+	case p.poolGuard <- true: //make reservation, blocks if poolGuard is full
+	case <-c.Done():
+		return nil, errors.New("context expired waiting for free connection")
+	}
+	conn := p.getPooled()
+	if conn != nil {
+		return conn, nil
+	}
+	conn, err := p.newConn()
+	if err != nil {
+		<-p.poolGuard //remove reservation
+		return nil, err
+	}
+	return conn, nil
+}
+
+//Do does a Get connection from pool and execute handler.
 //Release connection after handler is called.
 func (p *ConnPool) Do(handler func(*Conn) error) error {
 	conn, err := p.Get()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return handler(conn)
+}
+
+//DoWithContext does a GetWithContext connection from pool and execute handler.
+//Release connection after handler is called.
+func (p *ConnPool) DoWithContext(c context.Context, handler func(*Conn) error) error {
+	conn, err := p.GetWithContext(c)
 	if err != nil {
 		return err
 	}
